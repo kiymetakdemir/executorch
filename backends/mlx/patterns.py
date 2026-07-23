@@ -52,6 +52,7 @@ from executorch.backends.mlx.serialization.mlx_graph_schema import (
     SliceUpdateNode,
     SubtractIntNode,
     SymSizeNode,
+    UpdateAndAttendNode,
 )
 from torch.export.exported_program import ExportedProgram
 from torch.fx.node import Node
@@ -824,6 +825,84 @@ class MLXCustomSdpaHandler(PatternHandler):
             )
         )
 
+        return out_slot
+
+
+@REGISTRY.register_pattern(name="UPDATE_AND_ATTEND")
+class UpdateAndAttendHandler(PatternHandler):
+    """Pattern handler for the neutral kvcache::update_and_attend custom op.
+
+    The KV cache is off-graph runtime state: only q/k/v (BHSD) and per-query
+    positions are graph inputs. layer_id/scale are baked as node constants; the
+    runtime resolves the cache from the active registry by layer_id. Lowers to a
+    single UpdateAndAttendNode.
+    """
+
+    def __init__(
+        self,
+        head: Node,
+        body: List[Node],
+        query: Node,
+        key: Node,
+        value: Node,
+        position: Node,
+        layer_id: int,
+        scale: float,
+    ):
+        super().__init__(head, body)
+        self.query = query
+        self.key = key
+        self.value = value
+        self.position = position
+        self.layer_id = layer_id
+        self.scale = scale
+
+    @classmethod
+    def maybe_create(
+        cls, ep: ExportedProgram, head: Node
+    ) -> Optional["UpdateAndAttendHandler"]:
+        if head.op != "call_function":
+            return None
+        target_str = str(head.target)
+        if "update_and_attend" not in target_str or "kvcache" not in target_str:
+            return None
+
+        # Signature: update_and_attend(q, k, v, position, layer_id, scale, out_dtype)
+        args = head.args
+        if len(args) < 6:
+            return None
+
+        return UpdateAndAttendHandler(
+            head=head,
+            body=[],
+            query=args[0],
+            key=args[1],
+            value=args[2],
+            position=args[3],
+            layer_id=int(args[4]),
+            scale=args[5],
+        )
+
+    def __call__(self, P: MLXProgramBuilder, n: Node) -> Slot:
+        assert n == self.head
+
+        q_slot, k_slot, v_slot, pos_slot = P.slot_map(
+            [self.query, self.key, self.value, self.position]
+        )
+
+        out_slot = P.make_or_get_slot(n)
+        P.emit(
+            UpdateAndAttendNode(
+                q=P.slot_to_tid(q_slot),
+                k=P.slot_to_tid(k_slot),
+                v=P.slot_to_tid(v_slot),
+                position=P.slot_to_tid(pos_slot),
+                out=P.slot_to_tid(out_slot),
+                layer_id=self.layer_id,
+                scale=float(self.scale),
+                causal=True,
+            )
+        )
         return out_slot
 
 
