@@ -66,3 +66,63 @@ def export_to_mlx(
             memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
         ),
     )
+
+
+@experimental("This API is experimental and may change without notice.")
+def export_to_cuda(
+    model_id: str,
+    output_path: str | Path,
+    *,
+    config: DiffusionConfig,
+    revision: str | None = None,
+    pipeline: ResolvedDiffusionPipeline | None = None,
+    qlinear: str | None = None,
+    qlinear_group_size: int | None = None,
+) -> None:
+    """Discover and export a Hugging Face diffusion pipeline to CUDA."""
+    from executorch.backends.cuda.cuda_partitioner import CudaPartitioner
+    from executorch.exir import EdgeCompileConfig
+    from executorch.exir.capture._config import ExecutorchBackendConfig
+    from executorch.exir.passes import MemoryPlanningPass
+
+    def quantize(components, _pipeline):
+        if qlinear is not None:
+            from executorch.extension.llm.export.quantize import quantize_model_
+
+            denoiser = components.require("denoiser")
+            quantize_model_(
+                denoiser,
+                qlinear_config=qlinear,
+                qlinear_group_size=qlinear_group_size,
+                skip_incompatible_shapes=True,
+            )
+            if qlinear == "4w":
+                from executorch.backends.cuda.aoti_packed_int4_tensor import (
+                    pack_int4_weights_for_aoti,
+                )
+
+                pack_int4_weights_for_aoti(denoiser)
+        return components
+
+    programs, pipeline = export_huggingface(
+        model_id,
+        revision=revision,
+        config=config,
+        pipeline=pipeline,
+        component_transform=quantize,
+    )
+    lower_and_write_pte(
+        programs,
+        pipeline,
+        config,
+        output_path,
+        partitioners={name: [CudaPartitioner([])] for name in programs},
+        edge_compile_config=EdgeCompileConfig(
+            _check_ir_validity=False, _skip_dim_order=True
+        ),
+        backend_config=ExecutorchBackendConfig(
+            extract_delegate_segments=True,
+            memory_planning_pass=MemoryPlanningPass(alloc_graph_input=False),
+            do_quant_fusion_and_const_prop=True,
+        ),
+    )
